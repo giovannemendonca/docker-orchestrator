@@ -67,7 +67,9 @@ def add_record(client_id: str, container_id: str, container_name: str, port: int
     }
     with _lock:
         records = _read_state()
-        records = [r for r in records if r["client_id"] != client_id]
+        # Pool containers allow multiple records with same client_id
+        if client_id != "__pool__":
+            records = [r for r in records if r["client_id"] != client_id]
         records.append(record)
         _write_state(records)
     logger.info("[STATE] ADD record: CPF=%s container=%s port=%d", client_id, container_id[:12], port)
@@ -88,8 +90,8 @@ def touch_client(client_id: str) -> None:
 
 
 def find_oldest_accessed() -> dict | None:
-    """Return the record with the oldest last_accessed_at."""
-    records = load_records()
+    """Return the record with the oldest last_accessed_at (excludes pool containers)."""
+    records = [r for r in load_records() if r["client_id"] != "__pool__"]
     if not records:
         logger.info("[STATE] No records to find oldest")
         return None
@@ -112,3 +114,45 @@ def used_ports() -> set[int]:
     ports = {r["port"] for r in load_records()}
     logger.debug("[STATE] Used ports: %s", sorted(ports))
     return ports
+
+
+def find_unassigned() -> list[dict]:
+    """Return all pool records (client_id == '__pool__')."""
+    records = load_records()
+    pool = [r for r in records if r["client_id"] == "__pool__"]
+    logger.debug("[STATE] Pool containers: %d", len(pool))
+    return pool
+
+
+def claim_pool_container(client_id: str) -> dict | None:
+    """Claim a pool container for a specific client.
+
+    Finds the first __pool__ record, changes its client_id to the given CPF,
+    updates last_accessed_at, and returns the updated record.
+    Returns None if no pool container is available.
+    """
+    now = datetime.now().isoformat()
+    with _lock:
+        records = _read_state()
+
+        # Remove any existing record for this client
+        records = [r for r in records if r["client_id"] != client_id]
+
+        # Find first pool container
+        pool_rec = None
+        for rec in records:
+            if rec["client_id"] == "__pool__":
+                pool_rec = rec
+                break
+
+        if pool_rec is None:
+            logger.debug("[STATE] No pool container available to claim")
+            return None
+
+        pool_rec["client_id"] = client_id
+        pool_rec["last_accessed_at"] = now
+        _write_state(records)
+
+    logger.info("[STATE] CLAIM pool: container=%s port=%d -> CPF=%s",
+                pool_rec["container_id"][:12], pool_rec["port"], client_id)
+    return pool_rec

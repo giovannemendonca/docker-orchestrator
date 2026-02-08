@@ -6,6 +6,9 @@ Orquestrador HTTP em Python que cria e gerencia containers Docker VNC sob demand
 Cada cliente (identificado por CPF) recebe um container exclusivo com uma sessao
 Firefox em modo kiosk, acessivel pelo navegador via noVNC.
 
+O sistema mantem um **pool de containers pre-aquecidos** (warm pool) para que o
+usuario receba resposta instantanea, sem esperar o healthcheck (~12s).
+
 ```
                                   +---------------------+
                                   |   Container VNC     |
@@ -20,9 +23,10 @@ Firefox em modo kiosk, acessivel pelo navegador via noVNC.
   +----------------+              +---------------------+
          |
          |                        +---------------------+
-         +------- state.json      |   Container VNC     |
-                                  |   vnc_99900011122   |
+         +------- state.json      |   Container POOL    |
+                                  |   vnc_pool_5002     |
                                   |   porta 5002:6080   |
+                                  |   (pronto, sem CPF) |
                                   +---------------------+
 
          Todos na rede: vnc_network (10.10.0.0/24)
@@ -34,11 +38,14 @@ Firefox em modo kiosk, acessivel pelo navegador via noVNC.
 
 ```
 docker-orchestrator/
-  app.py              -> Aplicacao Flask (rotas HTTP + reconciliacao)
+  app.py              -> Setup Flask minimo (load_dotenv, Blueprint, __main__)
+  routes.py           -> Rotas HTTP (Blueprint): valida params, chama services
+  services.py         -> Logica de negocio: access, remove, reconciliacao, reciclagem
   containers.py       -> Operacoes Docker (criar, verificar, remover, rede)
   state.py            -> Persistencia em JSON com thread-safety
   scheduler.py        -> Agendador de limpeza automatica de containers ociosos
-  wsgi.py             -> Entry point Gunicorn (reconciliacao + scheduler no startup)
+  warm_pool.py        -> Gerenciador do pool de containers pre-aquecidos
+  wsgi.py             -> Entry point Gunicorn (reconciliacao + scheduler + pool no startup)
   requirements.txt    -> Dependencias Python
   Dockerfile          -> Imagem do orquestrador
   docker-compose.yml  -> Compose para rodar o orquestrador
@@ -54,7 +61,7 @@ docker-orchestrator/
 
 ### GET /access?id={CPF}
 
-Rota principal. Cria ou reutiliza um container VNC para o CPF informado.
+Rota principal. Atribui um container VNC ao CPF informado.
 
 **Parametros:**
 - `id` (obrigatorio): CPF do cliente
@@ -62,13 +69,18 @@ Rota principal. Cria ou reutiliza um container VNC para o CPF informado.
 **Fluxo:**
 1. Valida parametro `id`
 2. Busca registro no JSON pelo CPF
-3. Se existe e container esta saudavel -> atualiza `last_accessed_at` e redireciona
+3. Se existe e container esta saudavel -> atualiza `last_accessed_at` e redireciona (REUSO)
 4. Se existe mas container morreu -> remove registro, trata como novo
-5. Se nao existe -> aloca porta livre, cria container, aguarda healthy, redireciona
+5. Busca container do pool (`__pool__`) -> atribui CPF instantaneamente (POOL)
+6. Se nao tem pool -> aloca porta livre, cria container, aguarda healthy (CRIACAO)
 
 **Reciclagem automatica:**
 Se todas as portas estao ocupadas, o sistema mata o container com `last_accessed_at`
 mais antigo (quem esta ha mais tempo sem acessar) e reutiliza a porta.
+
+**Reposicao do pool:**
+Apos atribuir um container do pool ou criar um novo, o sistema repoe o pool
+em background (cria novo container `__pool__` se houver porta livre).
 
 **Respostas:**
 - `302` -> Redirect para `http://{VNC_HOST}:{porta}`
@@ -91,7 +103,8 @@ Lista todos os containers ativos e informacoes de estado.
 **Resposta:**
 ```json
 {
-  "active_containers": 3,
+  "active_containers": 2,
+  "pool_containers": 1,
   "max_slots": 4,
   "records": [
     {
@@ -101,6 +114,14 @@ Lista todos os containers ativos e informacoes de estado.
       "port": 5000,
       "created_at": "2026-02-08T14:30:00.000000",
       "last_accessed_at": "2026-02-08T16:45:00.000000"
+    },
+    {
+      "client_id": "__pool__",
+      "container_id": "c5ee497bg620...",
+      "container_name": "vnc_pool_5002",
+      "port": 5002,
+      "created_at": "2026-02-08T14:30:00.000000",
+      "last_accessed_at": "2026-02-08T14:30:00.000000"
     }
   ]
 }
@@ -111,6 +132,7 @@ Lista todos os containers ativos e informacoes de estado.
 ### GET /remove?id={CPF}
 
 Mata o container de um CPF especifico e remove o registro do JSON.
+Apos remover, repoe o pool em background.
 
 **Parametros:**
 - `id` (obrigatorio): CPF do cliente
@@ -136,7 +158,8 @@ GET http://localhost:8080/remove?id=06798162320
 
 ### GET /remove-all
 
-Mata TODOS os containers VNC gerenciados e limpa o JSON.
+Mata TODOS os containers VNC gerenciados (incluindo pool) e limpa o JSON.
+Apos remover, repoe o pool em background.
 
 **Resposta:**
 ```json
@@ -171,31 +194,57 @@ Health check simples.
 
 ## Modulos
 
-### app.py (Camada HTTP)
+### app.py (Setup Flask)
 
 Responsabilidades:
-- Receber requisicoes HTTP e orquestrar o fluxo
-- Redirecionar o cliente para a porta correta
-- Reconciliar estado ao iniciar (startup)
-- Reciclagem automatica quando portas esgotam
+- Carregar `.env` com `load_dotenv()` (DEVE ser a primeira linha antes de qualquer import)
+- Configurar logging
+- Criar instancia Flask
+- Registrar Blueprint de rotas
+
+### routes.py (Camada HTTP)
+
+Responsabilidades:
+- Receber requisicoes HTTP
+- Validar parametros
+- Chamar funcoes de `services.py`
+- Traduzir resultados para respostas HTTP (redirect, jsonify, status codes)
 
 Funcoes:
 
-| Funcao                    | O que faz                                           |
-|---------------------------|-----------------------------------------------------|
-| _reconcile_on_startup()   | Sincroniza JSON com Docker real ao iniciar           |
-| access()                  | Rota /access - cria ou reutiliza container           |
-| status()                  | Rota /status - lista containers ativos               |
-| remove()                  | Rota /remove - mata container de um CPF              |
-| remove_all()              | Rota /remove-all - mata todos os containers          |
-| health()                  | Rota /health - health check                          |
+| Funcao       | O que faz                                            |
+|--------------|------------------------------------------------------|
+| access()     | Rota /access - valida id, chama services, redirect   |
+| status()     | Rota /status - retorna JSON do services              |
+| remove()     | Rota /remove - valida id, chama services             |
+| remove_all() | Rota /remove-all - chama services                    |
+| health()     | Rota /health - retorna ok                            |
+
+### services.py (Camada de Negocio)
+
+Responsabilidades:
+- Logica de orquestracao: acesso, remocao, reconciliacao
+- Reciclagem automatica quando portas esgotam
+- Integracao com pool de containers
+- Nao conhece Flask (nao importa request/response)
+
+Funcoes:
+
+| Funcao                     | O que faz                                              |
+|----------------------------|--------------------------------------------------------|
+| reconcile_on_startup()     | Sincroniza JSON com Docker real ao iniciar             |
+| get_or_create_access(id)   | Fluxo principal: reuso -> pool -> criacao              |
+| get_status()               | Retorna dict com status (containers + pool)            |
+| remove_client(id)          | Remove container de 1 CPF, repoe pool                  |
+| remove_all_clients()       | Remove todos os containers, repoe pool                 |
+| _recycle_oldest_container() | Mata container mais antigo e retorna porta             |
 
 ### containers.py (Camada Docker)
 
 Responsabilidades:
 - Comunicar com o Docker daemon via socket
 - Gerenciar a rede Docker dedicada
-- Criar containers com a imagem VNC configurada
+- Criar containers com a imagem VNC configurada (com CPF ou pool)
 - Aguardar container ficar healthy antes de redirecionar
 - Verificar saude de containers
 - Remover containers
@@ -209,16 +258,33 @@ Funcoes:
 | ensure_network()                    | Cria a rede Docker se nao existir                |
 | is_container_healthy(container_id)  | Retorna True se o container esta running         |
 | create_container(client_id, port)   | Cria container vnc_{cpf} na porta especificada   |
+| create_pool_container(port)         | Cria container vnc_pool_{port} (sem CPF)         |
 | wait_container_ready(id, port)      | Aguarda Docker healthcheck reportar "healthy"    |
 | remove_container(container_id)      | Remove container com force=True                  |
 | allocate_port(used)                 | Retorna a primeira porta livre no range          |
 | list_running_orchestrated_containers| Lista todos os containers vnc_* ativos           |
+
+### warm_pool.py (Pool de Containers)
+
+Responsabilidades:
+- Manter N containers pre-aquecidos e prontos sem CPF
+- Repor pool automaticamente em background (thread daemon)
+- So criar se houver porta disponivel
+
+Funcoes:
+
+| Funcao            | O que faz                                                     |
+|-------------------|---------------------------------------------------------------|
+| replenish_pool()  | Verifica pool e cria containers ate WARM_POOL_SIZE (background) |
+| _fill_pool()      | Funcao interna que cria os containers necessarios             |
 
 ### scheduler.py (Limpeza Automatica)
 
 Responsabilidades:
 - Executar limpeza periodica de containers ociosos em background
 - Remover containers que nao sao acessados ha mais de N horas
+- Ignorar containers `__pool__` (sao reserva, nao ociosos)
+- Repor pool apos limpeza liberar portas
 - Rodar como thread daemon (nao bloqueia shutdown da aplicacao)
 
 Funcoes:
@@ -230,13 +296,6 @@ Funcoes:
 | _cleanup_idle_containers()    | Executa a limpeza: remove containers ociosos        |
 | _schedule_next()              | Agenda a proxima execucao do cleanup                |
 
-**Fluxo do cleanup:**
-1. Carrega todos os registros do JSON
-2. Para cada registro, calcula o tempo ocioso (`now - last_accessed_at`)
-3. Se ocioso > `IDLE_TIMEOUT_HOURS` -> mata o container e remove o registro
-4. Loga quantos containers foram removidos
-5. Agenda a proxima execucao em `CLEANUP_INTERVAL_MINUTES` minutos
-
 ### state.py (Camada de Persistencia)
 
 Responsabilidades:
@@ -245,19 +304,22 @@ Responsabilidades:
 - Escrita atomica (grava em .tmp e faz replace)
 - Criar o arquivo automaticamente se nao existir
 - Rastrear ultimo acesso de cada cliente
+- Gerenciar registros do pool (`__pool__`)
 
 Funcoes:
 
-| Funcao                    | O que faz                                           |
-|---------------------------|-----------------------------------------------------|
-| load_records()            | Carrega todos os registros do JSON                  |
-| save_records(records)     | Salva lista de registros no JSON                    |
-| find_by_client(client_id) | Busca registro por CPF                              |
-| add_record(...)           | Adiciona registro (nunca duplica client_id)         |
-| touch_client(client_id)   | Atualiza last_accessed_at do CPF                    |
-| find_oldest_accessed()    | Retorna registro com last_accessed_at mais antigo   |
-| remove_by_client(id)      | Remove registro pelo CPF                            |
-| used_ports()              | Retorna set de portas em uso                        |
+| Funcao                         | O que faz                                           |
+|--------------------------------|-----------------------------------------------------|
+| load_records()                 | Carrega todos os registros do JSON                  |
+| save_records(records)          | Salva lista de registros no JSON                    |
+| find_by_client(client_id)      | Busca registro por CPF                              |
+| add_record(...)                | Adiciona registro (nunca duplica client_id)         |
+| touch_client(client_id)        | Atualiza last_accessed_at do CPF                    |
+| find_oldest_accessed()         | Retorna registro com last_accessed_at mais antigo   |
+| remove_by_client(id)           | Remove registro pelo CPF                            |
+| used_ports()                   | Retorna set de portas em uso                        |
+| find_unassigned()              | Retorna lista de registros __pool__                 |
+| claim_pool_container(cpf)      | Atribui container __pool__ a um CPF                 |
 
 ---
 
@@ -272,18 +334,26 @@ Funcoes:
     "port": 5000,
     "created_at": "2026-02-08T14:30:00.000000",
     "last_accessed_at": "2026-02-08T16:45:00.000000"
+  },
+  {
+    "client_id": "__pool__",
+    "container_id": "c5ee497bg620a1b2c3d4e5f6...",
+    "container_name": "vnc_pool_5002",
+    "port": 5002,
+    "created_at": "2026-02-08T14:30:00.000000",
+    "last_accessed_at": "2026-02-08T14:30:00.000000"
   }
 ]
 ```
 
-| Campo            | Tipo   | Descricao                                |
-|------------------|--------|------------------------------------------|
-| client_id        | string | CPF do cliente (identificador unico)     |
-| container_id     | string | ID completo do container Docker          |
-| container_name   | string | Nome do container (vnc_{CPF})            |
-| port             | int    | Porta mapeada no host                    |
-| created_at       | string | Data/hora ISO de criacao                 |
-| last_accessed_at | string | Data/hora ISO do ultimo acesso           |
+| Campo            | Tipo   | Descricao                                          |
+|------------------|--------|-----------------------------------------------------|
+| client_id        | string | CPF do cliente ou `__pool__` (container reserva)    |
+| container_id     | string | ID completo do container Docker                     |
+| container_name   | string | Nome: `vnc_{CPF}` ou `vnc_pool_{porta}`             |
+| port             | int    | Porta mapeada no host                               |
+| created_at       | string | Data/hora ISO de criacao                            |
+| last_accessed_at | string | Data/hora ISO do ultimo acesso                      |
 
 ---
 
@@ -307,21 +377,28 @@ Requisicao: GET /access?id=11122233344
   [3] Container esta running?
         |
       SIM -> Atualiza last_accessed_at
-             Redirect para http://{VNC_HOST}:{porta} (REUSO)
+             Redirect (REUSO)
         |
-      NAO -> Remove registro do JSON
-             Remove container morto
+      NAO -> Remove registro + container morto
              Segue para [4]
         |
   NAO ENCONTROU
         |
         v
-  [4] Aloca porta livre no range
+  [4] Tem container __pool__ disponivel?
+        |
+      SIM -> Atribui CPF ao container do pool
+             Redirect (POOL - instantaneo!)
+             replenish_pool() em background
+        |
+      NAO
+        v
+  [5] Aloca porta livre no range
         |
    SEM PORTA LIVRE
         |
         v
-  [5] Reciclagem automatica
+  [6] Reciclagem automatica
         - Encontra container com last_accessed_at mais antigo
         - Mata o container
         - Remove registro
@@ -331,36 +408,71 @@ Requisicao: GET /access?id=11122233344
         |
    PORTA ALOCADA
         v
-  [6] Cria container Docker
+  [7] Cria container Docker
         - Nome: vnc_{CPF}
-        - Imagem: configurada via VNC_IMAGE
-        - Porta: {porta_alocada}:6080
+        - Imagem: VNC_IMAGE
+        - Porta: {porta}:6080
         - Rede: vnc_network
-        - ENVs: APPNAME, WIDTH, HEIGHT
         |
    FALHOU -> Retorna 500
         |
     CRIOU
         v
-  [7] Aguarda container ficar healthy
-        - Verifica Docker healthcheck a cada 1s
-        - Timeout de 60s
+  [8] Aguarda container ficar healthy (~12s)
         |
         v
-  [8] Persiste no JSON (com last_accessed_at = agora)
+  [9] Persiste no JSON
         |
         v
-  [9] Redirect para http://{VNC_HOST}:{porta} (NOVO)
+  [10] Redirect (CRIACAO)
+       replenish_pool() em background
 ```
+
+---
+
+## Pool de Containers Pre-aquecidos (Warm Pool)
+
+O `warm_pool.py` mantem N containers Docker ja iniciados e saudaveis, sem CPF
+atribuido, prontos para serem usados instantaneamente.
+
+```
+STARTUP:
+  reconcile -> scheduler -> replenish_pool()
+                              |
+                              v
+                         Porta livre? -> Cria N containers vnc_pool_* (background)
+
+/access?id=CPF:
+  1. CPF ja tem container?         -> REUSO (igual sempre)
+  2. Tem container __pool__ pronto? -> ATRIBUI CPF (0s de espera!)
+     -> replenish_pool() em background (repoe o pool)
+  3. Sem pool disponivel           -> CRIA novo container (~12s)
+     -> replenish_pool() em background
+
+/remove ou /remove-all:
+  -> Apos remover, replenish_pool() em background (porta liberada)
+
+Cleanup (scheduler):
+  -> Apos limpar containers ociosos, replenish_pool() em background
+```
+
+**Configuracao:**
+
+| Variavel        | Default | Descricao                                         |
+|-----------------|---------|---------------------------------------------------|
+| WARM_POOL_SIZE  | 1       | Numero de containers pre-aquecidos sem CPF         |
+
+Se `WARM_POOL_SIZE=0`, o pool e desabilitado e o comportamento e identico ao antigo
+(cria container sob demanda com espera do healthcheck).
 
 ---
 
 ## Reconciliacao no Startup
 
-Quando o orquestrador (re)inicia, `_reconcile_on_startup()` garante consistencia:
+Quando o orquestrador (re)inicia, `reconcile_on_startup()` garante consistencia:
 
 ```
-  [1] Loga toda a configuracao (ENVs, imagem, portas, rede)
+  [1] Loga toda a configuracao (ENVs, imagem, portas, rede, pool)
   [2] Le registros do JSON
   [3] Lista containers vnc_* rodando no Docker
       |
@@ -372,7 +484,8 @@ Quando o orquestrador (re)inicia, `_reconcile_on_startup()` garante consistencia
       |
       v
   Para cada container vnc_* rodando SEM registro no JSON:
-      - Recupera: cria registro a partir do container ativo
+      - vnc_pool_* -> Recupera como __pool__
+      - vnc_{CPF}  -> Recupera com CPF extraido do nome
       |
       v
   Salva JSON limpo
@@ -384,7 +497,7 @@ Quando o orquestrador (re)inicia, `_reconcile_on_startup()` garante consistencia
 
 O `scheduler.py` roda uma thread em background que periodicamente verifica
 containers que nao foram acessados ha mais de `IDLE_TIMEOUT_HOURS` horas
-e os remove automaticamente.
+e os remove automaticamente. Containers `__pool__` sao ignorados (sao reserva).
 
 ```
   A cada CLEANUP_INTERVAL_MINUTES (default: 30 min):
@@ -392,23 +505,17 @@ e os remove automaticamente.
       v
   [1] Carrega registros do JSON
   [2] Para cada registro:
+      - Se __pool__ -> pula (nao e ocioso)
       - Calcula tempo ocioso: now - last_accessed_at
       - Se ocioso > IDLE_TIMEOUT_HOURS:
           -> Mata o container Docker
           -> Remove registro do JSON
-          -> Loga a remocao
       - Se nao:
           -> Pula (container ainda ativo)
   [3] Loga total de removidos
-  [4] Agenda proxima execucao
+  [4] Se removeu algum -> replenish_pool() (repoe pool com portas liberadas)
+  [5] Agenda proxima execucao
 ```
-
-**Configuracao:**
-
-| Variavel                  | Default | Descricao                                      |
-|---------------------------|---------|-------------------------------------------------|
-| IDLE_TIMEOUT_HOURS        | 8       | Horas sem acesso para considerar ocioso         |
-| CLEANUP_INTERVAL_MINUTES  | 30      | Intervalo entre execucoes da limpeza (minutos)  |
 
 ---
 
@@ -443,13 +550,13 @@ O orquestrador mapeia apenas a porta 6080 (acesso web).
 ## Mapeamento de Portas
 
 ```
-Host                            Container
- :5000  ---- vnc_cpf1 -------> :6080 (noVNC)
- :5001  ---- vnc_cpf2 -------> :6080 (noVNC)
- :5002  ---- vnc_cpf3 -------> :6080 (noVNC)
- :5003  ---- vnc_cpf4 -------> :6080 (noVNC)
+Host                              Container
+ :5000  ---- vnc_cpf1 ----------> :6080 (noVNC)
+ :5001  ---- vnc_cpf2 ----------> :6080 (noVNC)
+ :5002  ---- vnc_pool_5002 -----> :6080 (noVNC) [POOL - pronto]
+ :5003  ---- vnc_cpf3 ----------> :6080 (noVNC)
 
- :8080  ---- orquestrador ----> Flask API
+ :8080  ---- orquestrador ------> Flask API
 ```
 
 ---
@@ -458,25 +565,26 @@ Host                            Container
 
 ### Orquestrador
 
-| Variavel              | Default                        | Descricao                              |
-|-----------------------|--------------------------------|----------------------------------------|
-| VNC_HOST              | localhost                      | Host usado na URL de redirect          |
-| VNC_IMAGE             | ghcr.io/giovannemendonca/...   | Imagem Docker dos containers VNC       |
-| VNC_CONTAINER_PORT    | 6080                           | Porta interna do container (noVNC web) |
-| PORT_RANGE_MIN        | 5000                           | Inicio do range de portas do host      |
-| PORT_RANGE_MAX        | 5003                           | Fim do range de portas do host         |
-| ORCHESTRATOR_PORT     | 8080                           | Porta do proprio orquestrador          |
-| STATE_FILE            | state.json                     | Caminho do arquivo de estado           |
-| DOCKER_NETWORK_NAME   | vnc_network                    | Nome da rede Docker dedicada           |
-| DOCKER_NETWORK_SUBNET | 10.10.0.0/24                   | Subnet da rede (evitar conflito)       |
-| IDLE_TIMEOUT_HOURS    | 8                              | Horas de inatividade para limpeza      |
-| CLEANUP_INTERVAL_MINUTES | 30                          | Intervalo (min) entre limpezas         |
+| Variavel                 | Default                      | Descricao                              |
+|--------------------------|------------------------------|----------------------------------------|
+| VNC_HOST                 | localhost                    | Host usado na URL de redirect          |
+| VNC_IMAGE                | ghcr.io/giovannemendonca/... | Imagem Docker dos containers VNC       |
+| VNC_CONTAINER_PORT       | 6080                         | Porta interna do container (noVNC web) |
+| PORT_RANGE_MIN           | 5000                         | Inicio do range de portas do host      |
+| PORT_RANGE_MAX           | 5003                         | Fim do range de portas do host         |
+| ORCHESTRATOR_PORT        | 8080                         | Porta do proprio orquestrador          |
+| STATE_FILE               | state.json                   | Caminho do arquivo de estado           |
+| DOCKER_NETWORK_NAME      | vnc_network                  | Nome da rede Docker dedicada           |
+| DOCKER_NETWORK_SUBNET    | 10.10.0.0/24                 | Subnet da rede (evitar conflito)       |
+| IDLE_TIMEOUT_HOURS       | 8                            | Horas de inatividade para limpeza      |
+| CLEANUP_INTERVAL_MINUTES | 30                           | Intervalo (min) entre limpezas         |
+| WARM_POOL_SIZE           | 1                            | Qtd de containers pre-aquecidos        |
 
 ### Repassadas aos Containers VNC
 
 | Variavel do Orquestrador | ENV no Container | Default                           |
 |--------------------------|------------------|-----------------------------------|
-| VNC_APPNAME              | APPNAME          | firefox-kiosk https://youtube.com |
+| VNC_APPNAME              | APPNAME          | firefox-kiosk https://google.com  |
 | VNC_WIDTH                | WIDTH            | 410                               |
 | VNC_HEIGHT               | HEIGHT           | 900                               |
 
@@ -488,13 +596,13 @@ Todas as operacoes sao logadas com tags para facilitar filtragem:
 
 | Tag           | Modulo         | O que registra                              |
 |---------------|----------------|---------------------------------------------|
-| [ACCESS]      | app.py         | Requisicoes de acesso, reuso, criacao        |
-| [RECYCLE]     | app.py         | Reciclagem automatica de containers          |
-| [RECONCILE]   | app.py         | Reconciliacao no startup                     |
-| [STATUS]      | app.py         | Consultas de status                          |
-| [REMOVE]      | app.py/cont.py | Remocao de containers individuais            |
-| [REMOVE-ALL]  | app.py         | Remocao em massa                             |
-| [CREATE]      | containers.py  | Criacao de containers                        |
+| [ACCESS]      | services.py    | Requisicoes de acesso, reuso, pool, criacao  |
+| [RECYCLE]     | services.py    | Reciclagem automatica de containers          |
+| [RECONCILE]   | services.py    | Reconciliacao no startup                     |
+| [STATUS]      | services.py    | Consultas de status                          |
+| [REMOVE]      | services/cont. | Remocao de containers individuais            |
+| [REMOVE-ALL]  | services.py    | Remocao em massa                             |
+| [CREATE]      | containers.py  | Criacao de containers (CPF e pool)           |
 | [WAIT]        | containers.py  | Espera por healthcheck                       |
 | [NETWORK]     | containers.py  | Criacao/reuso de rede Docker                 |
 | [PORT]        | containers.py  | Alocacao de portas                           |
@@ -502,6 +610,7 @@ Todas as operacoes sao logadas com tags para facilitar filtragem:
 | [HEALTH CHECK]| containers.py  | Verificacao de saude de container            |
 | [STATE]       | state.py       | Operacoes de leitura/escrita no JSON         |
 | [CLEANUP]     | scheduler.py   | Limpeza automatica de containers ociosos     |
+| [POOL]        | warm_pool.py   | Pool de containers pre-aquecidos             |
 
 Exemplo de saida no terminal:
 ```
@@ -516,53 +625,29 @@ Exemplo de saida no terminal:
   NETWORK_NAME    = vnc_network
   NETWORK_SUBNET  = 10.10.0.0/24
 ====================================
-[RECONCILE] Found 0 records in JSON
-[RECONCILE] Found 0 running vnc_* containers in Docker
-[RECONCILE] Done: 0 active records after reconciliation
+[RECONCILE] WARM_POOL_SIZE = 1
+[RECONCILE] Done: 0 active records (0 clients + 0 pool) after reconciliation
 =============================================
-========== ORCHESTRATOR RUNNING on port 8080 ==========
-
-[ACCESS] -------- Request for CPF=06798162320 --------
-[ACCESS] No existing record for CPF=06798162320, will create new container
-[ACCESS] Ports in use: [] (0/4)
-[PORT] Allocated port 5000 (used: 0/4)
-[CREATE] Starting creation: name=vnc_06798162320 port=5000
-[NETWORK] Network already exists: name=vnc_network id=6679640fff89
-[CREATE] Container CREATED: name=vnc_06798162320 id=b4dd386af519 port=5000
-[WAIT] Waiting for container b4dd386af519 to be healthy (timeout=60s)...
-[WAIT] Container b4dd386af519 is HEALTHY (took 12.3s)
-[STATE] ADD record: CPF=06798162320 container=b4dd386af519 port=5000
-[ACCESS] SUCCESS: CPF=06798162320 -> container=b4dd386af519 port=5000
-
-[ACCESS] -------- Request for CPF=06798162320 --------
-[ACCESS] Container HEALTHY -> REUSING, redirect to http://localhost:5000
-[STATE] TOUCH: CPF=06798162320 last_accessed_at=2026-02-08T16:45:00
-
-[RECYCLE] All ports full! Recycling oldest container...
-[RECYCLE] Victim: CPF=06798162320 port=5000 last_accessed=2026-02-08T10:15:00
-[REMOVE] Killing container: name=vnc_06798162320 id=b4dd386af519
-[RECYCLE] Port 5000 freed, reusing for CPF=99999999999
-
-[REMOVE] -------- Remove request for CPF=06798162320 --------
-[REMOVE] Killing container: name=vnc_06798162320 id=b4dd386af519
-[REMOVE] SUCCESS: CPF=06798162320 container removed
-
-[REMOVE-ALL] -------- Remove all containers --------
-[REMOVE-ALL] SUCCESS: 4 containers removed
 
 ========== CLEANUP SCHEDULER ==========
 [CLEANUP] IDLE_TIMEOUT_HOURS      = 8
 [CLEANUP] CLEANUP_INTERVAL_MINUTES = 30
 =======================================
-[CLEANUP] Next cleanup scheduled in 30 minutes
 
-[CLEANUP] -------- Scheduled cleanup started --------
-[CLEANUP] IDLE_TIMEOUT_HOURS = 8
-[CLEANUP] Cutoff time: 2026-02-08T08:45:00
-[CLEANUP] Total records: 3
-[CLEANUP] IDLE container: CPF=06798162320 port=5000 last_accessed=2026-02-08T06:10:00 (idle 10.6h > 8h)
-[CLEANUP] Done: removed 1 idle containers
-[CLEANUP] Next cleanup scheduled in 30 minutes
+[POOL] Replenishing pool: current=0 target=1 need=1
+[POOL] Creating pool container on port 5000...
+[CREATE] Starting POOL creation: name=vnc_pool_5000 port=5000
+[WAIT] Container abc123 is HEALTHY (took 12.3s)
+[POOL] Pool container READY: name=vnc_pool_5000 port=5000 (1/1)
+
+========== ORCHESTRATOR RUNNING on port 8080 ==========
+
+[ACCESS] -------- Request for CPF=06798162320 --------
+[ACCESS] No existing record for CPF=06798162320
+[STATE] CLAIM pool: container=abc123 port=5000 -> CPF=06798162320
+[ACCESS] POOL -> assigned container=abc123 port=5000 to CPF=06798162320 (instant!)
+[POOL] Replenishing pool: current=0 target=1 need=1
+[POOL] Creating pool container on port 5001...
 ```
 
 ---
@@ -571,15 +656,17 @@ Exemplo de saida no terminal:
 
 1. **Um container por CPF**: O JSON nunca permite duplicatas de client_id
 2. **Reuso obrigatorio**: Se o container esta running, redireciona sem criar novo
-3. **Criacao so quando necessario**: Novo container apenas se nao existe registro ou container morreu
-4. **Reciclagem automatica**: Quando portas esgotam, mata o container com acesso mais antigo
-5. **Aguarda container pronto**: Espera Docker healthcheck reportar "healthy" antes de redirecionar
-6. **Sobrevive a restart**: Reconciliacao sincroniza JSON com Docker real
-7. **Sem banco de dados**: Apenas arquivo JSON local
-8. **Thread-safe**: Lock em todas as operacoes de leitura/escrita do JSON
-9. **Escrita atomica**: Grava em .tmp e faz replace para evitar corrupcao
-10. **Rede dedicada**: Subnet configuravel para evitar conflito em producao
-11. **Limpeza automatica**: Remove containers ociosos a cada N minutos (configuravel)
+3. **Pool pre-aquecido**: Containers prontos para atribuicao instantanea
+4. **Reposicao automatica do pool**: Apos atribuir, remover ou limpar, repoe em background
+5. **Reciclagem automatica**: Quando portas esgotam, mata o container com acesso mais antigo
+6. **Aguarda container pronto**: Espera Docker healthcheck reportar "healthy"
+7. **Sobrevive a restart**: Reconciliacao sincroniza JSON com Docker real
+8. **Sem banco de dados**: Apenas arquivo JSON local
+9. **Thread-safe**: Lock em todas as operacoes de leitura/escrita do JSON
+10. **Escrita atomica**: Grava em .tmp e faz replace para evitar corrupcao
+11. **Rede dedicada**: Subnet configuravel para evitar conflito em producao
+12. **Limpeza automatica**: Remove containers ociosos a cada N minutos (configuravel)
+13. **Separacao de responsabilidades**: Routes (HTTP) / Services (negocio) / Containers (Docker)
 
 ---
 
@@ -601,13 +688,13 @@ docker compose up -d
 # Criar/acessar container para um CPF
 curl -L http://localhost:8080/access?id=11122233344
 
-# Ver containers ativos
+# Ver containers ativos (inclui pool)
 curl http://localhost:8080/status
 
 # Remover container de um CPF
 curl http://localhost:8080/remove?id=11122233344
 
-# Remover TODOS os containers
+# Remover TODOS os containers (incluindo pool)
 curl http://localhost:8080/remove-all
 
 # Health check
@@ -625,4 +712,5 @@ PORT_RANGE_MAX=7050
 DOCKER_NETWORK_SUBNET=10.20.0.0/24
 IDLE_TIMEOUT_HOURS=8
 CLEANUP_INTERVAL_MINUTES=30
+WARM_POOL_SIZE=2
 ```

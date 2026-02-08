@@ -18,7 +18,10 @@ _timer: threading.Timer | None = None
 
 
 def _cleanup_idle_containers() -> None:
-    """Remove containers that have been idle for more than IDLE_TIMEOUT_HOURS."""
+    """Remove containers that have been idle for more than IDLE_TIMEOUT_HOURS.
+
+    Pool containers (__pool__) are skipped — they are managed by warm_pool.py.
+    """
     logger.info("[CLEANUP] -------- Scheduled cleanup started --------")
     logger.info("[CLEANUP] IDLE_TIMEOUT_HOURS = %d", IDLE_TIMEOUT_HOURS)
 
@@ -30,6 +33,11 @@ def _cleanup_idle_containers() -> None:
 
     removed = 0
     for rec in records:
+        # Skip pool containers — they are not idle, they are reserve
+        if rec["client_id"] == "__pool__":
+            logger.debug("[CLEANUP] Skipping pool container: port=%d", rec["port"])
+            continue
+
         last_accessed = rec.get("last_accessed_at", rec.get("created_at", ""))
 
         if not last_accessed:
@@ -61,6 +69,11 @@ def _cleanup_idle_containers() -> None:
 
     logger.info("[CLEANUP] Done: removed %d idle containers", removed)
     logger.info("[CLEANUP] ----------------------------------------")
+
+    # Replenish pool if containers were freed
+    if removed > 0:
+        import warm_pool
+        warm_pool.replenish_pool()
 
     # Schedule next run
     _schedule_next()

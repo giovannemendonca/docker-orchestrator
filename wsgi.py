@@ -1,5 +1,8 @@
-from app import app, _reconcile_on_startup
+from app import app
+from services import reconcile_on_startup
 import scheduler
+import warm_pool
 
-_reconcile_on_startup()
+reconcile_on_startup()
 scheduler.start_scheduler()
+warm_pool.replenish_pool()

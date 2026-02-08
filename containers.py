@@ -120,6 +120,50 @@ def create_container(client_id: str, port: int) -> dict:
     }
 
 
+def create_pool_container(port: int) -> dict:
+    """Create a warm pool container (no CPF assigned yet)."""
+    container_name = f"vnc_pool_{port}"
+
+    logger.info("[CREATE] Starting POOL creation: name=%s port=%d image=%s", container_name, port, IMAGE[:50])
+
+    # Remove leftover container with same name if it exists
+    try:
+        old = client.containers.get(container_name)
+        logger.warning("[CREATE] Found leftover pool container %s (id=%s), removing...", container_name, old.id[:12])
+        old.remove(force=True)
+    except docker.errors.NotFound:
+        logger.debug("[CREATE] No leftover pool container found for %s", container_name)
+
+    network_name = ensure_network()
+
+    logger.info("[CREATE] Running docker create (pool): %s -> %s:%d network=%s",
+                container_name, CONTAINER_PORT, port, network_name)
+
+    container = client.containers.run(
+        IMAGE,
+        name=container_name,
+        ports={f"{CONTAINER_PORT}/tcp": ("0.0.0.0", port)},
+        environment={
+            "APPNAME": APPNAME,
+            "WIDTH": WIDTH,
+            "HEIGHT": HEIGHT,
+        },
+        network=network_name,
+        detach=True,
+        restart_policy={"Name": "unless-stopped"},
+    )
+
+    logger.info("[CREATE] Pool container CREATED: name=%s id=%s port=%d", container_name, container.id[:12], port)
+
+    wait_container_ready(container.id, port)
+
+    return {
+        "container_id": container.id,
+        "container_name": container_name,
+        "port": port,
+    }
+
+
 def wait_container_ready(container_id: str, port: int, timeout: int = 60) -> bool:
     """Wait until the Docker healthcheck reports 'healthy'."""
     logger.info("[WAIT] Waiting for container %s to be healthy (timeout=%ds)...", container_id[:12], timeout)
