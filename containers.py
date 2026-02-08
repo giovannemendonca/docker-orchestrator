@@ -1,6 +1,8 @@
 import docker
 import logging
 import os
+import socket
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,9 @@ APPNAME = os.environ.get("VNC_APPNAME", "firefox-kiosk https://google.com")
 WIDTH = os.environ.get("VNC_WIDTH", "390")
 HEIGHT = os.environ.get("VNC_HEIGHT", "900")
 
+NETWORK_NAME = os.environ.get("DOCKER_NETWORK_NAME", "vnc_network")
+NETWORK_SUBNET = os.environ.get("DOCKER_NETWORK_SUBNET", "10.10.0.0/24")
+
 client = docker.from_env()
 
 
@@ -28,7 +33,33 @@ def log_config():
     logger.info("  APPNAME         = %s", APPNAME)
     logger.info("  WIDTH           = %s", WIDTH)
     logger.info("  HEIGHT          = %s", HEIGHT)
+    logger.info("  NETWORK_NAME    = %s", NETWORK_NAME)
+    logger.info("  NETWORK_SUBNET  = %s", NETWORK_SUBNET)
     logger.info("====================================")
+
+
+def ensure_network() -> str:
+    """Ensure the dedicated Docker network exists. Create it if needed."""
+    try:
+        network = client.networks.get(NETWORK_NAME)
+        logger.info("[NETWORK] Network already exists: name=%s id=%s", NETWORK_NAME, network.id[:12])
+        return NETWORK_NAME
+    except docker.errors.NotFound:
+        pass
+
+    logger.info("[NETWORK] Creating network: name=%s subnet=%s", NETWORK_NAME, NETWORK_SUBNET)
+
+    ipam_pool = docker.types.IPAMPool(subnet=NETWORK_SUBNET)
+    ipam_config = docker.types.IPAMConfig(pool_configs=[ipam_pool])
+
+    network = client.networks.create(
+        NETWORK_NAME,
+        driver="bridge",
+        ipam=ipam_config,
+    )
+
+    logger.info("[NETWORK] Network CREATED: name=%s id=%s subnet=%s", NETWORK_NAME, network.id[:12], NETWORK_SUBNET)
+    return NETWORK_NAME
 
 
 def is_container_healthy(container_id: str) -> bool:
@@ -59,8 +90,10 @@ def create_container(client_id: str, port: int) -> dict:
     except docker.errors.NotFound:
         logger.debug("[CREATE] No leftover container found for %s", container_name)
 
-    logger.info("[CREATE] Running docker create: %s -> %s:%d env=[APPNAME=%s, WIDTH=%s, HEIGHT=%s]",
-                container_name, CONTAINER_PORT, port, APPNAME, WIDTH, HEIGHT)
+    network_name = ensure_network()
+
+    logger.info("[CREATE] Running docker create: %s -> %s:%d network=%s env=[APPNAME=%s, WIDTH=%s, HEIGHT=%s]",
+                container_name, CONTAINER_PORT, port, network_name, APPNAME, WIDTH, HEIGHT)
 
     container = client.containers.run(
         IMAGE,
@@ -71,17 +104,50 @@ def create_container(client_id: str, port: int) -> dict:
             "WIDTH": WIDTH,
             "HEIGHT": HEIGHT,
         },
+        network=network_name,
         detach=True,
         restart_policy={"Name": "unless-stopped"},
     )
 
     logger.info("[CREATE] Container CREATED: name=%s id=%s port=%d", container_name, container.id[:12], port)
 
+    wait_container_ready(container.id, port)
+
     return {
         "container_id": container.id,
         "container_name": container_name,
         "port": port,
     }
+
+
+def wait_container_ready(container_id: str, port: int, timeout: int = 60) -> bool:
+    """Wait until the Docker healthcheck reports 'healthy'."""
+    logger.info("[WAIT] Waiting for container %s to be healthy (timeout=%ds)...", container_id[:12], timeout)
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            container = client.containers.get(container_id)
+            health = container.attrs.get("State", {}).get("Health", {}).get("Status", "none")
+            logger.debug("[WAIT] container=%s health=%s (%.1fs)", container_id[:12], health, time.time() - start)
+
+            if health == "healthy":
+                elapsed = round(time.time() - start, 1)
+                logger.info("[WAIT] Container %s is HEALTHY (took %.1fs)", container_id[:12], elapsed)
+                return True
+
+            if health == "unhealthy":
+                elapsed = round(time.time() - start, 1)
+                logger.warning("[WAIT] Container %s is UNHEALTHY after %.1fs", container_id[:12], elapsed)
+                return False
+
+        except docker.errors.NotFound:
+            logger.warning("[WAIT] Container %s disappeared while waiting", container_id[:12])
+            return False
+
+        time.sleep(1)
+
+    logger.warning("[WAIT] Container %s not healthy after %ds, redirecting anyway", container_id[:12], timeout)
+    return False
 
 
 def remove_container(container_id: str) -> None:
