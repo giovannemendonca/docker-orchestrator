@@ -9,6 +9,7 @@ from flask import Flask, request, redirect, jsonify
 
 import state
 import containers
+import scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -223,6 +224,7 @@ def health():
 
 if __name__ == "__main__":
     _reconcile_on_startup()
+    scheduler.start_scheduler()
     port = int(os.environ.get("ORCHESTRATOR_PORT", 8080))
     logger.info("========== ORCHESTRATOR RUNNING on port %d ==========", port)
     app.run(host="0.0.0.0", port=port)

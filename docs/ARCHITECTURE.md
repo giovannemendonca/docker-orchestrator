@@ -37,7 +37,8 @@ docker-orchestrator/
   app.py              -> Aplicacao Flask (rotas HTTP + reconciliacao)
   containers.py       -> Operacoes Docker (criar, verificar, remover, rede)
   state.py            -> Persistencia em JSON com thread-safety
-  wsgi.py             -> Entry point Gunicorn (reconciliacao no startup)
+  scheduler.py        -> Agendador de limpeza automatica de containers ociosos
+  wsgi.py             -> Entry point Gunicorn (reconciliacao + scheduler no startup)
   requirements.txt    -> Dependencias Python
   Dockerfile          -> Imagem do orquestrador
   docker-compose.yml  -> Compose para rodar o orquestrador
@@ -213,6 +214,29 @@ Funcoes:
 | allocate_port(used)                 | Retorna a primeira porta livre no range          |
 | list_running_orchestrated_containers| Lista todos os containers vnc_* ativos           |
 
+### scheduler.py (Limpeza Automatica)
+
+Responsabilidades:
+- Executar limpeza periodica de containers ociosos em background
+- Remover containers que nao sao acessados ha mais de N horas
+- Rodar como thread daemon (nao bloqueia shutdown da aplicacao)
+
+Funcoes:
+
+| Funcao                        | O que faz                                           |
+|-------------------------------|-----------------------------------------------------|
+| start_scheduler()             | Inicia o agendador de limpeza periodica             |
+| stop_scheduler()              | Para o agendador (cancela o timer)                  |
+| _cleanup_idle_containers()    | Executa a limpeza: remove containers ociosos        |
+| _schedule_next()              | Agenda a proxima execucao do cleanup                |
+
+**Fluxo do cleanup:**
+1. Carrega todos os registros do JSON
+2. Para cada registro, calcula o tempo ocioso (`now - last_accessed_at`)
+3. Se ocioso > `IDLE_TIMEOUT_HOURS` -> mata o container e remove o registro
+4. Loga quantos containers foram removidos
+5. Agenda a proxima execucao em `CLEANUP_INTERVAL_MINUTES` minutos
+
 ### state.py (Camada de Persistencia)
 
 Responsabilidades:
@@ -356,6 +380,38 @@ Quando o orquestrador (re)inicia, `_reconcile_on_startup()` garante consistencia
 
 ---
 
+## Limpeza Automatica de Containers Ociosos
+
+O `scheduler.py` roda uma thread em background que periodicamente verifica
+containers que nao foram acessados ha mais de `IDLE_TIMEOUT_HOURS` horas
+e os remove automaticamente.
+
+```
+  A cada CLEANUP_INTERVAL_MINUTES (default: 30 min):
+      |
+      v
+  [1] Carrega registros do JSON
+  [2] Para cada registro:
+      - Calcula tempo ocioso: now - last_accessed_at
+      - Se ocioso > IDLE_TIMEOUT_HOURS:
+          -> Mata o container Docker
+          -> Remove registro do JSON
+          -> Loga a remocao
+      - Se nao:
+          -> Pula (container ainda ativo)
+  [3] Loga total de removidos
+  [4] Agenda proxima execucao
+```
+
+**Configuracao:**
+
+| Variavel                  | Default | Descricao                                      |
+|---------------------------|---------|-------------------------------------------------|
+| IDLE_TIMEOUT_HOURS        | 8       | Horas sem acesso para considerar ocioso         |
+| CLEANUP_INTERVAL_MINUTES  | 30      | Intervalo entre execucoes da limpeza (minutos)  |
+
+---
+
 ## Rede Docker
 
 Todos os containers VNC sao criados em uma rede Docker dedicada com subnet configuravel.
@@ -413,6 +469,8 @@ Host                            Container
 | STATE_FILE            | state.json                     | Caminho do arquivo de estado           |
 | DOCKER_NETWORK_NAME   | vnc_network                    | Nome da rede Docker dedicada           |
 | DOCKER_NETWORK_SUBNET | 10.10.0.0/24                   | Subnet da rede (evitar conflito)       |
+| IDLE_TIMEOUT_HOURS    | 8                              | Horas de inatividade para limpeza      |
+| CLEANUP_INTERVAL_MINUTES | 30                          | Intervalo (min) entre limpezas         |
 
 ### Repassadas aos Containers VNC
 
@@ -443,6 +501,7 @@ Todas as operacoes sao logadas com tags para facilitar filtragem:
 | [SCAN]        | containers.py  | Varredura de containers rodando              |
 | [HEALTH CHECK]| containers.py  | Verificacao de saude de container            |
 | [STATE]       | state.py       | Operacoes de leitura/escrita no JSON         |
+| [CLEANUP]     | scheduler.py   | Limpeza automatica de containers ociosos     |
 
 Exemplo de saida no terminal:
 ```
@@ -490,6 +549,20 @@ Exemplo de saida no terminal:
 
 [REMOVE-ALL] -------- Remove all containers --------
 [REMOVE-ALL] SUCCESS: 4 containers removed
+
+========== CLEANUP SCHEDULER ==========
+[CLEANUP] IDLE_TIMEOUT_HOURS      = 8
+[CLEANUP] CLEANUP_INTERVAL_MINUTES = 30
+=======================================
+[CLEANUP] Next cleanup scheduled in 30 minutes
+
+[CLEANUP] -------- Scheduled cleanup started --------
+[CLEANUP] IDLE_TIMEOUT_HOURS = 8
+[CLEANUP] Cutoff time: 2026-02-08T08:45:00
+[CLEANUP] Total records: 3
+[CLEANUP] IDLE container: CPF=06798162320 port=5000 last_accessed=2026-02-08T06:10:00 (idle 10.6h > 8h)
+[CLEANUP] Done: removed 1 idle containers
+[CLEANUP] Next cleanup scheduled in 30 minutes
 ```
 
 ---
@@ -506,6 +579,7 @@ Exemplo de saida no terminal:
 8. **Thread-safe**: Lock em todas as operacoes de leitura/escrita do JSON
 9. **Escrita atomica**: Grava em .tmp e faz replace para evitar corrupcao
 10. **Rede dedicada**: Subnet configuravel para evitar conflito em producao
+11. **Limpeza automatica**: Remove containers ociosos a cada N minutos (configuravel)
 
 ---
 
@@ -549,4 +623,6 @@ VNC_APPNAME=firefox-kiosk https://meu-site.com/
 PORT_RANGE_MIN=7000
 PORT_RANGE_MAX=7050
 DOCKER_NETWORK_SUBNET=10.20.0.0/24
+IDLE_TIMEOUT_HOURS=8
+CLEANUP_INTERVAL_MINUTES=30
 ```
