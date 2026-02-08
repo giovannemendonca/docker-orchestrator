@@ -165,6 +165,57 @@ def status():
     })
 
 
+@app.route("/remove")
+def remove():
+    client_id = request.args.get("id", "").strip()
+
+    if not client_id:
+        logger.warning("[REMOVE] Request with missing 'id' parameter")
+        return jsonify({"error": "Missing required parameter: id"}), 400
+
+    logger.info("[REMOVE] -------- Remove request for CPF=%s --------", client_id)
+
+    record = state.find_by_client(client_id)
+
+    if not record:
+        logger.warning("[REMOVE] No record found for CPF=%s", client_id)
+        return jsonify({"error": f"No container found for id {client_id}"}), 404
+
+    logger.info("[REMOVE] Found record: CPF=%s container=%s port=%d", client_id, record["container_id"][:12], record["port"])
+    containers.remove_container(record["container_id"])
+    state.remove_by_client(client_id)
+    logger.info("[REMOVE] SUCCESS: CPF=%s container removed and record deleted", client_id)
+
+    return jsonify({
+        "status": "removed",
+        "client_id": client_id,
+        "container_id": record["container_id"],
+        "port": record["port"],
+    })
+
+
+@app.route("/remove-all")
+def remove_all():
+    logger.info("[REMOVE-ALL] -------- Remove all containers --------")
+
+    records = state.load_records()
+
+    if not records:
+        logger.info("[REMOVE-ALL] No containers to remove")
+        return jsonify({"status": "empty", "removed": 0})
+
+    removed = 0
+    for rec in records:
+        logger.info("[REMOVE-ALL] Removing: CPF=%s container=%s port=%d", rec["client_id"], rec["container_id"][:12], rec["port"])
+        containers.remove_container(rec["container_id"])
+        removed += 1
+
+    state.save_records([])
+    logger.info("[REMOVE-ALL] SUCCESS: %d containers removed", removed)
+
+    return jsonify({"status": "removed_all", "removed": removed})
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
