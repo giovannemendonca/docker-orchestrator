@@ -474,11 +474,11 @@ Host                            Container
 
 ### Repassadas aos Containers VNC
 
-| Variavel do Orquestrador | ENV no Container | Default                                                    |
-|--------------------------|------------------|------------------------------------------------------------|
-| VNC_APPNAME              | APPNAME          | firefox-kiosk https://mv-proxy.unimedceara.com.br/mvpep/  |
-| VNC_WIDTH                | WIDTH            | 410                                                        |
-| VNC_HEIGHT               | HEIGHT           | 900                                                        |
+| Variavel do Orquestrador | ENV no Container | Default                           |
+|--------------------------|------------------|-----------------------------------|
+| VNC_APPNAME              | APPNAME          | firefox-kiosk https://youtube.com |
+| VNC_WIDTH                | WIDTH            | 410                               |
+| VNC_HEIGHT               | HEIGHT           | 900                               |
 
 ---
 
@@ -510,7 +510,7 @@ Exemplo de saida no terminal:
   IMAGE           = ghcr.io/giovannemendonca/firefox-flash-kiosk:4bda8f1...
   CONTAINER_PORT  = 6080
   PORT_RANGE      = 5000 - 5003 (4 slots)
-  APPNAME         = firefox-kiosk https://mv-proxy.unimedceara.com.br/mvpep/
+  APPNAME         = firefox-kiosk https://youtube.com
   WIDTH           = 410
   HEIGHT          = 900
   NETWORK_NAME    = vnc_network
