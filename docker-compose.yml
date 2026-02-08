@@ -1,0 +1,23 @@
+services:
+  orchestrator:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - orchestrator-data:/app/data
+    environment:
+      - STATE_FILE=/app/data/state.json
+      - VNC_HOST=${VNC_HOST:-localhost}
+      - VNC_IMAGE=${VNC_IMAGE:-ghcr.io/giovannemendonca/firefox-flash-kiosk:4bda8f16af52b0c2593505a7359e49a252728573}
+      - VNC_CONTAINER_PORT=${VNC_CONTAINER_PORT:-6080}
+      - VNC_APPNAME=${VNC_APPNAME:-firefox-kiosk https://google.com}
+      - VNC_WIDTH=${VNC_WIDTH:-390}
+      - VNC_HEIGHT=${VNC_HEIGHT:-900}
+      - PORT_RANGE_MIN=${PORT_RANGE_MIN:-5000}
+      - PORT_RANGE_MAX=${PORT_RANGE_MAX:-5020}
+      - ORCHESTRATOR_PORT=8080
+    restart: unless-stopped
+
+volumes:
+  orchestrator-data:
