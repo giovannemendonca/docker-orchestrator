@@ -252,9 +252,14 @@ docker-orchestrator/
 
 ## Logs e Monitoramento
 
-- Os logs são exibidos no console durante a execução
-- O arquivo `state.json` mantém o estado de todos os containers
-- Use `docker-compose logs -f` para acompanhar os logs em tempo real
+Os logs são salvos automaticamente em `logs/app.log.YYYY-MM-DD` (um arquivo por dia, mantém 7 dias).
+
+Para detalhes completos sobre:
+- 📊 Sistema de logs (rotação, retenção, filtragem)
+- 🚀 Scripts de inicialização (start.sh)
+- 📁 Estrutura de arquivos
+
+Consulte `docs/ARCHITECTURE.md` - Documentação Completa
 
 ## Resolução de Problemas
 

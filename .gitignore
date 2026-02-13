@@ -9,3 +9,11 @@ state.json
 state.json.tmp
 
 *.log
+logs/
+
+# Arquivo de PID (criado em runtime pelo start.sh)
+orchestrator.pid
+
+# Certificados e chaves de segurança
+fullchain.crt
+server.key

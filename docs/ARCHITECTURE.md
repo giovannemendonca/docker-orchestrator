@@ -714,3 +714,165 @@ IDLE_TIMEOUT_HOURS=8
 CLEANUP_INTERVAL_MINUTES=30
 WARM_POOL_SIZE=2
 ```
+
+---
+
+## Scripts de Inicialização
+
+### Arquivo: start.sh
+
+Script Bash para Linux que inicia o Docker Orchestrator em background (segundo plano).
+
+**Primeira utilização:**
+```bash
+chmod +x start.sh
+./start.sh
+```
+
+**O que o script faz automaticamente:**
+- ✅ Cria ambiente virtual (venv/) se não existir
+- ✅ Ativa o ambiente virtual
+- ✅ Instala dependências do requirements.txt
+- ✅ Cria diretório logs/
+- ✅ Inicia a aplicação em background
+- ✅ Salva PID em arquivo orchestrator.pid
+
+**Comandos:**
+```bash
+# Iniciar
+./start.sh
+
+# Parar
+./start.sh stop
+
+# Ver logs em tempo real
+tail -f logs/app.log.$(date +%Y-%m-%d)
+
+# Ver últimas 50 linhas
+tail -50 logs/app.log.$(date +%Y-%m-%d)
+
+# Procurar erros
+grep ERROR logs/app.log.$(date +%Y-%m-%d)
+
+# Ver status do processo
+ps aux | grep app.py
+```
+
+**Vantagens:**
+- Terminal fica livre para outras tarefas
+- Aplicação continua rodando mesmo após fechar o terminal
+- Logs separados por data em `logs/app.log.YYYY-MM-DD`
+- Fácil parar com `./start.sh stop`
+
+---
+
+## Sistema de Logs
+
+### Localização e Estrutura
+
+Os logs são salvos automaticamente pelo app.py em:
+```
+logs/app.log.YYYY-MM-DD
+```
+
+Exemplo:
+```
+logs/
+├── app.log.2026-02-13  ← Logs de hoje (arquivo ativo)
+├── app.log.2026-02-12  ← Logs de ontem
+├── app.log.2026-02-11
+├── app.log.2026-02-10
+├── app.log.2026-02-09
+├── app.log.2026-02-08
+├── app.log.2026-02-07
+└── (arquivos com 8+ dias são automaticamente deletados)
+```
+
+**Características:**
+- Um arquivo por dia (rotação automática à meia-noite)
+- Mantém 7 dias de histórico
+- Sem confusão de múltiplos arquivos
+- Logs aparecem no arquivo conforme a aplicação roda
+
+### Configuração Técnica
+
+Implementado em `app.py` usando `TimedRotatingFileHandler`:
+
+```python
+from logging.handlers import TimedRotatingFileHandler
+from datetime import datetime
+
+# Cria pasta logs/ se não existir
+logs_dir = "logs"
+if not os.path.exists(logs_dir):
+    os.makedirs(logs_dir)
+
+# Data atual
+current_date = datetime.now().strftime("%Y-%m-%d")
+log_filename = os.path.join(logs_dir, f"app.log.{current_date}")
+
+# Handler com rotação diária
+file_handler = TimedRotatingFileHandler(
+    filename=log_filename,
+    when="midnight",      # Rotaciona à meia-noite
+    interval=1,          # A cada dia
+    backupCount=7,       # Mantém 7 dias
+    utc=False,          # Usa horário local
+)
+file_handler.suffix = "%Y-%m-%d"
+```
+
+### Retenção de Logs
+
+| Configuração | Valor |
+|--------------|-------|
+| Intervalo de rotação | Diário (à meia-noite) |
+| Formato do arquivo | app.log.YYYY-MM-DD |
+| Dias mantidos | 7 dias |
+| Limpeza automática | Sim (arquivos com 8+ dias) |
+
+### Exemplos de Uso
+
+```bash
+# Ver logs de hoje em tempo real
+tail -f logs/app.log.$(date +%Y-%m-%d)
+
+# Ver logs de ontem
+tail -f logs/app.log.$(date -d yesterday +%Y-%m-%d)
+
+# Ver últimas 50 linhas
+tail -50 logs/app.log.$(date +%Y-%m-%d)
+
+# Contar erros de hoje
+grep -c ERROR logs/app.log.$(date +%Y-%m-%d)
+
+# Procurar um CPF específico
+grep "06798162320" logs/app.log.$(date +%Y-%m-%d)
+
+# Ver WARNING
+grep WARNING logs/app.log.$(date +%Y-%m-%d)
+
+# Ver todos os logs dos últimos 7 dias
+tail -f logs/app.log.*
+```
+
+### Tags de Log para Filtragem
+
+Os logs incluem tags dos módulos para fácil filtragem:
+
+```bash
+# Ver apenas reconciliação
+grep "\[RECONCILE\]" logs/app.log.$(date +%Y-%m-%d)
+
+# Ver apenas acessos
+grep "\[ACCESS\]" logs/app.log.$(date +%Y-%m-%d)
+
+# Ver apenas criação de containers
+grep "\[CREATE\]" logs/app.log.$(date +%Y-%m-%d)
+
+# Ver apenas limpeza automática
+grep "\[CLEANUP\]" logs/app.log.$(date +%Y-%m-%d)
+
+# Ver apenas pool
+grep "\[POOL\]" logs/app.log.$(date +%Y-%m-%d)
+```
