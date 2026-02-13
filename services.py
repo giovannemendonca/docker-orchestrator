@@ -122,7 +122,7 @@ def get_or_create_access(client_id: str) -> dict:
 
         if containers.is_container_healthy(record["container_id"]):
             state.touch_client(client_id)
-            url = f"http://{VNC_HOST}:{record['port']}"
+            url = f"https://{VNC_HOST}:{record['port']}"
             logger.info("[ACCESS] Container HEALTHY -> REUSING, redirect to %s", url)
             return {"action": "reused", "url": url}
         else:
@@ -138,7 +138,7 @@ def get_or_create_access(client_id: str) -> dict:
     pool_rec = state.claim_pool_container(client_id)
     if pool_rec:
         if containers.is_container_healthy(pool_rec["container_id"]):
-            url = f"http://{VNC_HOST}:{pool_rec['port']}"
+            url = f"https://{VNC_HOST}:{pool_rec['port']}"
             logger.info("[ACCESS] POOL -> assigned container=%s port=%d to CPF=%s (instant!)",
                          pool_rec["container_id"][:12], pool_rec["port"], client_id)
 
@@ -182,7 +182,7 @@ def get_or_create_access(client_id: str) -> dict:
         port=info["port"],
     )
 
-    url = f"http://{VNC_HOST}:{port}"
+    url = f"https://{VNC_HOST}:{port}"
     logger.info("[ACCESS] SUCCESS: CPF=%s -> container=%s port=%d, redirect to %s",
                 client_id, info["container_id"][:12], port, url)
 
