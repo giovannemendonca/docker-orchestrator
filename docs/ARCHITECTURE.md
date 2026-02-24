@@ -59,20 +59,30 @@ docker-orchestrator/
 
 ## Rotas HTTP
 
-### GET /access?id={CPF}
+### GET /access?id={CPF}[&width={W}&height={H}]
 
 Rota principal. Atribui um container VNC ao CPF informado.
 
 **Parametros:**
 - `id` (obrigatorio): CPF do cliente
+- `width` (opcional): Largura da tela em pixels
+- `height` (opcional): Altura da tela em pixels
+
+> **Regra das dimensoes:** `width` e `height` devem ser informados **juntos**.
+> Se apenas um for enviado, ambos sao ignorados e o sistema usa os valores default
+> das variaveis de ambiente (`VNC_WIDTH` / `VNC_HEIGHT`).
 
 **Fluxo:**
 1. Valida parametro `id`
-2. Busca registro no JSON pelo CPF
-3. Se existe e container esta saudavel -> atualiza `last_accessed_at` e redireciona (REUSO)
-4. Se existe mas container morreu -> remove registro, trata como novo
-5. Busca container do pool (`__pool__`) -> atribui CPF instantaneamente (POOL)
-6. Se nao tem pool -> aloca porta livre, cria container, aguarda healthy (CRIACAO)
+2. Resolve dimensoes: se vieram ambos `width` e `height` -> usa custom; caso contrario usa ENVs
+3. Busca registro no JSON pelo CPF
+   - Se existe e container esta saudavel:
+     - Dimensoes **iguais** -> atualiza `last_accessed_at` e redireciona (REUSO)
+     - Dimensoes **diferentes** -> mata container, recria com novas dimensoes
+   - Se existe mas container morreu -> remove registro, trata como novo
+4. **Se NAO houver dimensoes custom**: tenta usar container do pool (`__pool__`) - atribuicao instantanea (POOL)
+5. **Se houver dimensoes custom**: pula o pool (containers do pool usam dimensoes default)
+6. Se nao tem pool ou dimensoes custom -> aloca porta livre, cria container com as dimensoes resolvidas, aguarda healthy (CRIACAO)
 
 **Reciclagem automatica:**
 Se todas as portas estao ocupadas, o sistema mata o container com `last_accessed_at`
@@ -83,15 +93,24 @@ Apos atribuir um container do pool ou criar um novo, o sistema repoe o pool
 em background (cria novo container `__pool__` se houver porta livre).
 
 **Respostas:**
-- `302` -> Redirect para `http://{VNC_HOST}:{porta}`
+- `302` -> Redirect para `https://{VNC_HOST}:{porta}`
 - `400` -> `{"error": "Missing required parameter: id"}`
 - `503` -> `{"error": "No available ports..."}`
 - `500` -> `{"error": "Failed to create container: ..."}`
 
-**Exemplo:**
+**Exemplos:**
 ```
+# Dimensoes default (usa pool se disponivel)
 GET http://localhost:8080/access?id=06798162320
--> 302 redirect para http://localhost:5000
+-> 302 redirect para https://localhost:5001
+
+# Dimensoes customizadas (pula pool, cria container dedicado)
+GET http://localhost:8080/access?id=06798162320&width=1024&height=768
+-> 302 redirect para https://localhost:5001
+
+# Somente um parametro -> ignorado, usa default
+GET http://localhost:8080/access?id=06798162320&width=1024
+-> usa VNC_WIDTH e VNC_HEIGHT das ENVs
 ```
 
 ---
@@ -105,13 +124,15 @@ Lista todos os containers ativos e informacoes de estado.
 {
   "active_containers": 2,
   "pool_containers": 1,
-  "max_slots": 4,
+  "max_slots": 20,
   "records": [
     {
       "client_id": "06798162320",
       "container_id": "b4dd386af519...",
       "container_name": "vnc_06798162320",
-      "port": 5000,
+      "port": 5001,
+      "width": "1024",
+      "height": "768",
       "created_at": "2026-02-08T14:30:00.000000",
       "last_accessed_at": "2026-02-08T16:45:00.000000"
     },
@@ -120,6 +141,8 @@ Lista todos os containers ativos e informacoes de estado.
       "container_id": "c5ee497bg620...",
       "container_name": "vnc_pool_5002",
       "port": 5002,
+      "width": "410",
+      "height": "900",
       "created_at": "2026-02-08T14:30:00.000000",
       "last_accessed_at": "2026-02-08T14:30:00.000000"
     }
@@ -230,14 +253,14 @@ Responsabilidades:
 
 Funcoes:
 
-| Funcao                     | O que faz                                              |
-|----------------------------|--------------------------------------------------------|
-| reconcile_on_startup()     | Sincroniza JSON com Docker real ao iniciar             |
-| get_or_create_access(id)   | Fluxo principal: reuso -> pool -> criacao              |
-| get_status()               | Retorna dict com status (containers + pool)            |
-| remove_client(id)          | Remove container de 1 CPF, repoe pool                  |
-| remove_all_clients()       | Remove todos os containers, repoe pool                 |
-| _recycle_oldest_container() | Mata container mais antigo e retorna porta             |
+| Funcao                              | O que faz                                                         |
+|-------------------------------------|-------------------------------------------------------------------|
+| reconcile_on_startup()              | Sincroniza JSON com Docker real ao iniciar                        |
+| get_or_create_access(id, w, h)      | Fluxo principal: reuso (com checagem de dimensoes) -> pool -> criacao |
+| get_status()                        | Retorna dict com status (containers + pool)                       |
+| remove_client(id)                   | Remove container de 1 CPF, repoe pool                             |
+| remove_all_clients()                | Remove todos os containers, repoe pool                            |
+| _recycle_oldest_container()         | Mata container mais antigo e retorna porta                        |
 
 ### containers.py (Camada Docker)
 
@@ -252,17 +275,17 @@ Responsabilidades:
 
 Funcoes:
 
-| Funcao                              | O que faz                                        |
-|-------------------------------------|--------------------------------------------------|
-| log_config()                        | Loga toda a configuracao no startup              |
-| ensure_network()                    | Cria a rede Docker se nao existir                |
-| is_container_healthy(container_id)  | Retorna True se o container esta running         |
-| create_container(client_id, port)   | Cria container vnc_{cpf} na porta especificada   |
-| create_pool_container(port)         | Cria container vnc_pool_{port} (sem CPF)         |
-| wait_container_ready(id, port)      | Aguarda Docker healthcheck reportar "healthy"    |
-| remove_container(container_id)      | Remove container com force=True                  |
-| allocate_port(used)                 | Retorna a primeira porta livre no range          |
-| list_running_orchestrated_containers| Lista todos os containers vnc_* ativos           |
+| Funcao                              | O que faz                                                      |
+|-------------------------------------|----------------------------------------------------------------|
+| log_config()                        | Loga toda a configuracao no startup                            |
+| ensure_network()                    | Cria a rede Docker se nao existir                              |
+| is_container_healthy(container_id)  | Retorna True se o container esta running                       |
+| create_container(id, port, w, h)    | Cria container vnc_{cpf} com dimensoes resolvidas (custom/ENV) |
+| create_pool_container(port)         | Cria container vnc_pool_{port} com dimensoes default das ENVs  |
+| wait_container_ready(id, port)      | Aguarda Docker healthcheck reportar "healthy"                  |
+| remove_container(container_id)      | Remove container com force=True                                |
+| allocate_port(used)                 | Retorna a primeira porta livre no range                        |
+| list_running_orchestrated_containers| Lista todos os containers vnc_* ativos                         |
 
 ### warm_pool.py (Pool de Containers)
 
@@ -308,18 +331,18 @@ Responsabilidades:
 
 Funcoes:
 
-| Funcao                         | O que faz                                           |
-|--------------------------------|-----------------------------------------------------|
-| load_records()                 | Carrega todos os registros do JSON                  |
-| save_records(records)          | Salva lista de registros no JSON                    |
-| find_by_client(client_id)      | Busca registro por CPF                              |
-| add_record(...)                | Adiciona registro (nunca duplica client_id)         |
-| touch_client(client_id)        | Atualiza last_accessed_at do CPF                    |
-| find_oldest_accessed()         | Retorna registro com last_accessed_at mais antigo   |
-| remove_by_client(id)           | Remove registro pelo CPF                            |
-| used_ports()                   | Retorna set de portas em uso                        |
-| find_unassigned()              | Retorna lista de registros __pool__                 |
-| claim_pool_container(cpf)      | Atribui container __pool__ a um CPF                 |
+| Funcao                           | O que faz                                                        |
+|----------------------------------|------------------------------------------------------------------|
+| load_records()                   | Carrega todos os registros do JSON                               |
+| save_records(records)            | Salva lista de registros no JSON                                 |
+| find_by_client(client_id)        | Busca registro por CPF                                           |
+| add_record(..., width, height)   | Adiciona registro com dimensoes (nunca duplica client_id)        |
+| touch_client(client_id)          | Atualiza last_accessed_at do CPF                                 |
+| find_oldest_accessed()           | Retorna registro com last_accessed_at mais antigo                |
+| remove_by_client(id)             | Remove registro pelo CPF                                         |
+| used_ports()                     | Retorna set de portas em uso                                     |
+| find_unassigned()                | Retorna lista de registros __pool__                              |
+| claim_pool_container(cpf, w, h)  | Atribui container __pool__ a um CPF e grava dimensoes no registro|
 
 ---
 
@@ -331,7 +354,9 @@ Funcoes:
     "client_id": "06798162320",
     "container_id": "b4dd386af519a1b2c3d4e5f6...",
     "container_name": "vnc_06798162320",
-    "port": 5000,
+    "port": 5001,
+    "width": "1024",
+    "height": "768",
     "created_at": "2026-02-08T14:30:00.000000",
     "last_accessed_at": "2026-02-08T16:45:00.000000"
   },
@@ -340,27 +365,35 @@ Funcoes:
     "container_id": "c5ee497bg620a1b2c3d4e5f6...",
     "container_name": "vnc_pool_5002",
     "port": 5002,
+    "width": "410",
+    "height": "900",
     "created_at": "2026-02-08T14:30:00.000000",
     "last_accessed_at": "2026-02-08T14:30:00.000000"
   }
 ]
 ```
 
-| Campo            | Tipo   | Descricao                                          |
-|------------------|--------|-----------------------------------------------------|
-| client_id        | string | CPF do cliente ou `__pool__` (container reserva)    |
-| container_id     | string | ID completo do container Docker                     |
-| container_name   | string | Nome: `vnc_{CPF}` ou `vnc_pool_{porta}`             |
-| port             | int    | Porta mapeada no host                               |
-| created_at       | string | Data/hora ISO de criacao                            |
-| last_accessed_at | string | Data/hora ISO do ultimo acesso                      |
+| Campo            | Tipo   | Descricao                                                          |
+|------------------|--------|--------------------------------------------------------------------|
+| client_id        | string | CPF do cliente ou `__pool__` (container reserva)                   |
+| container_id     | string | ID completo do container Docker                                    |
+| container_name   | string | Nome: `vnc_{CPF}` ou `vnc_pool_{porta}`                            |
+| port             | int    | Porta mapeada no host                                              |
+| width            | string | Largura da tela (pixels) usada na criacao do container             |
+| height           | string | Altura da tela (pixels) usada na criacao do container              |
+| created_at       | string | Data/hora ISO de criacao                                           |
+| last_accessed_at | string | Data/hora ISO do ultimo acesso                                     |
+
+> **Nota:** Os campos `width` e `height` sao usados para detectar mudanca de resolucao.
+> Se uma nova requisicao chegar com dimensoes diferentes das gravadas, o container antigo
+> e destruido e um novo e criado com as novas dimensoes.
 
 ---
 
-## Fluxo Principal (/access?id={CPF})
+## Fluxo Principal (/access?id={CPF}[&width={W}&height={H}])
 
 ```
-Requisicao: GET /access?id=11122233344
+Requisicao: GET /access?id=11122233344[&width=W&height=H]
         |
         v
   [1] Parametro "id" existe?
@@ -369,36 +402,45 @@ Requisicao: GET /access?id=11122233344
         |
       SIM
         v
-  [2] Busca registro no JSON pelo CPF
+  [2] Resolve dimensoes:
+        - Vieram AMBOS width e height? -> custom_dimensions=True, usa os valores
+        - Veio so 1 ou nenhum?         -> custom_dimensions=False, usa VNC_WIDTH/VNC_HEIGHT das ENVs
+        |
+        v
+  [3] Busca registro no JSON pelo CPF
         |
    ENCONTROU
         |
         v
-  [3] Container esta running?
+  [4] Container esta running?
         |
-      SIM -> Atualiza last_accessed_at
-             Redirect (REUSO)
+      SIM -> Dimensoes do registro == dimensoes da requisicao?
+               SIM -> Atualiza last_accessed_at -> Redirect (REUSO)
+               NAO -> Remove container + registro (dimensoes mudaram)
+                      Segue para [5]
         |
       NAO -> Remove registro + container morto
-             Segue para [4]
+             Segue para [5]
         |
   NAO ENCONTROU
         |
         v
-  [4] Tem container __pool__ disponivel?
+  [5] custom_dimensions == False?
         |
-      SIM -> Atribui CPF ao container do pool
-             Redirect (POOL - instantaneo!)
-             replenish_pool() em background
+      SIM -> Tem container __pool__ disponivel?
+               SIM -> Atribui CPF + grava dimensoes no registro
+                      Redirect (POOL - instantaneo!)
+                      replenish_pool() em background
+               NAO -> Segue para [6]
         |
-      NAO
+      NAO (custom) -> Pula o pool diretamente para [6]
         v
-  [5] Aloca porta livre no range
+  [6] Aloca porta livre no range
         |
    SEM PORTA LIVRE
         |
         v
-  [6] Reciclagem automatica
+  [7] Reciclagem automatica
         - Encontra container com last_accessed_at mais antigo
         - Mata o container
         - Remove registro
@@ -408,23 +450,24 @@ Requisicao: GET /access?id=11122233344
         |
    PORTA ALOCADA
         v
-  [7] Cria container Docker
+  [8] Cria container Docker com dimensoes resolvidas
         - Nome: vnc_{CPF}
         - Imagem: VNC_IMAGE
         - Porta: {porta}:6080
         - Rede: vnc_network
+        - ENV WIDTH, HEIGHT (custom ou default)
         |
    FALHOU -> Retorna 500
         |
     CRIOU
         v
-  [8] Aguarda container ficar healthy (~12s)
+  [9] Aguarda container ficar healthy (~12s)
         |
         v
-  [9] Persiste no JSON
+  [10] Persiste no JSON (inclui width e height)
         |
         v
-  [10] Redirect (CRIACAO)
+  [11] Redirect (CRIACAO)
        replenish_pool() em background
 ```
 
@@ -441,12 +484,21 @@ STARTUP:
                               |
                               v
                          Porta livre? -> Cria N containers vnc_pool_* (background)
+                         (usando dimensoes default VNC_WIDTH / VNC_HEIGHT das ENVs)
 
-/access?id=CPF:
-  1. CPF ja tem container?         -> REUSO (igual sempre)
-  2. Tem container __pool__ pronto? -> ATRIBUI CPF (0s de espera!)
+/access?id=CPF [sem width/height customizados]:
+  1. CPF ja tem container com mesmas dimensoes?  -> REUSO (atualiza timestamp)
+  2. CPF tem container com dimensoes diferentes? -> MATA + RECRIA com novas dimensoes
+  3. Tem container __pool__ pronto?              -> ATRIBUI CPF (0s de espera!)
      -> replenish_pool() em background (repoe o pool)
-  3. Sem pool disponivel           -> CRIA novo container (~12s)
+  4. Sem pool disponivel                         -> CRIA novo container (~12s)
+     -> replenish_pool() em background
+
+/access?id=CPF&width=W&height=H [com dimensoes customizadas]:
+  1. CPF ja tem container com mesmas dimensoes?  -> REUSO (atualiza timestamp)
+  2. CPF tem container com dimensoes diferentes? -> MATA + RECRIA com novas dimensoes
+  3. PULA o pool (pool usa dimensoes default, nao custom)
+  4. CRIA novo container com WIDTH=W, HEIGHT=H (~12s)
      -> replenish_pool() em background
 
 /remove ou /remove-all:

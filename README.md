@@ -131,15 +131,34 @@ gunicorn -w 4 -b 0.0.0.0:8080 wsgi:app
 Cria ou acessa um container VNC existente para um CPF. Retorna um redirecionamento para a URL do VNC.
 
 **Parâmetros:**
-- `id`: CPF do cliente (obrigatório)
+- `id` (obrigatório): CPF do cliente
+- `width` (opcional): Largura da tela em pixels
+- `height` (opcional): Altura da tela em pixels
 
-**Exemplo:**
+> **Regra das dimensões:** `width` e `height` devem ser enviados **juntos**. Se apenas um for
+> enviado, ambos são ignorados e o sistema usa os valores default das variáveis de ambiente
+> (`VNC_WIDTH` / `VNC_HEIGHT`). Quando as dimensões customizadas são informadas, o warm pool
+> (container em standby) é ignorado e um novo container é criado diretamente.
+
+**Comportamento de reutilização:**
+- Se o cliente já tem um container com as **mesmas dimensões** → reutiliza (sem recriação)
+- Se o cliente já tem um container mas as **dimensões mudaram** → mata o antigo e cria novo
+- Se o container está morto → recria automaticamente
+
+**Exemplos:**
 ```bash
+# Com dimensões padrão (usa VNC_WIDTH e VNC_HEIGHT das ENVs, pode usar pool)
 GET /access?id=111.222.333-44
+
+# Com dimensões customizadas (cria container dedicado, ignora pool)
+GET /access?id=111.222.333-44&width=1024&height=768
+
+# Somente um parâmetro → IGNORADO, usa default das ENVs
+GET /access?id=111.222.333-44&width=1024
 ```
 
 **Response:**
-- Redirecionamento HTTP 302 para `http://localhost:5000` (ou porta disponível)
+- Redirecionamento HTTP 302 para `https://localhost:5000` (ou porta disponível)
 - Em caso de erro:
 ```json
 {
@@ -154,13 +173,16 @@ Lista todos os containers ativos e informações do sistema.
 ```json
 {
   "active_containers": 2,
-  "max_slots": 21,
+  "pool_containers": 1,
+  "max_slots": 20,
   "records": [
     {
       "client_id": "111.222.333-44",
       "container_id": "abc123def456",
       "container_name": "vnc_11122233344",
-      "port": 5000,
+      "port": 5001,
+      "width": "1024",
+      "height": "768",
       "created_at": "2026-02-08T10:30:00.123456",
       "last_accessed_at": "2026-02-08T11:00:00.123456"
     }
@@ -207,11 +229,16 @@ Verifica se o serviço está funcionando.
 
 ## Exemplo de Uso
 
-1. **Acessar/criar container para um cliente**:
+1. **Acessar/criar container para um cliente (dimensões default das ENVs)**:
    ```bash
    curl "http://localhost:8080/access?id=111.222.333-44"
    ```
-   Ou abra no navegador: `http://localhost:8080/access?id=111.222.333-44`
+
+   **Com dimensões customizadas (ambos obrigatórios juntos)**:
+   ```bash
+   curl "http://localhost:8080/access?id=111.222.333-44&width=1024&height=768"
+   ```
+   Ou abra no navegador: `http://localhost:8080/access?id=111.222.333-44&width=1024&height=768`
 
 2. **Verificar status do sistema e listar containers**:
    ```bash

@@ -76,8 +76,11 @@ def is_container_healthy(container_id: str) -> bool:
         return False
 
 
-def create_container(client_id: str, port: int) -> dict:
+def create_container(client_id: str, port: int,
+                     width: str | None = None, height: str | None = None) -> dict:
     container_name = f"vnc_{client_id}"
+    use_width = width or WIDTH
+    use_height = height or HEIGHT
 
     logger.info("[CREATE] Starting creation: name=%s port=%d image=%s", container_name, port, IMAGE[:50])
 
@@ -93,7 +96,7 @@ def create_container(client_id: str, port: int) -> dict:
     network_name = ensure_network()
 
     logger.info("[CREATE] Running docker create: %s -> %s:%d network=%s env=[APPNAME=%s, WIDTH=%s, HEIGHT=%s]",
-                container_name, CONTAINER_PORT, port, network_name, APPNAME, WIDTH, HEIGHT)
+                container_name, CONTAINER_PORT, port, network_name, APPNAME, use_width, use_height)
 
     container = client.containers.run(
         IMAGE,
@@ -101,8 +104,8 @@ def create_container(client_id: str, port: int) -> dict:
         ports={f"{CONTAINER_PORT}/tcp": ("0.0.0.0", port)},
         environment={
             "APPNAME": APPNAME,
-            "WIDTH": WIDTH,
-            "HEIGHT": HEIGHT,
+            "WIDTH": use_width,
+            "HEIGHT": use_height,
         },
         network=network_name,
         detach=True,

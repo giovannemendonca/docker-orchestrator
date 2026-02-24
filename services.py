@@ -100,8 +100,15 @@ def reconcile_on_startup() -> None:
 # Access (main flow)
 # ---------------------------------------------------------------------------
 
-def get_or_create_access(client_id: str) -> dict:
+def get_or_create_access(client_id: str,
+                         width: str | None = None,
+                         height: str | None = None) -> dict:
     """Main access flow for a client.
+
+    Args:
+        client_id: CPF or unique identifier.
+        width: Optional custom width. If None, uses ENV default.
+        height: Optional custom height. If None, uses ENV default.
 
     Returns:
         dict with keys:
@@ -111,20 +118,37 @@ def get_or_create_access(client_id: str) -> dict:
         ValueError: no ports available and nothing to recycle
         RuntimeError: container creation failed
     """
-    logger.info("[ACCESS] -------- Request for CPF=%s --------", client_id)
+    # Resolve final dimensions (custom or ENV default)
+    use_width = width or containers.WIDTH
+    use_height = height or containers.HEIGHT
+    custom_dimensions = width is not None and height is not None
+
+    logger.info("[ACCESS] -------- Request for CPF=%s (width=%s height=%s custom=%s) --------",
+                client_id, use_width, use_height, custom_dimensions)
 
     # 1. Check existing record
     record = state.find_by_client(client_id)
 
     if record:
-        logger.info("[ACCESS] Found existing record: CPF=%s container=%s port=%d",
-                     client_id, record["container_id"][:12], record["port"])
+        logger.info("[ACCESS] Found existing record: CPF=%s container=%s port=%d (w=%s h=%s)",
+                     client_id, record["container_id"][:12], record["port"],
+                     record.get("width", "?"), record.get("height", "?"))
 
         if containers.is_container_healthy(record["container_id"]):
-            state.touch_client(client_id)
-            url = f"https://{VNC_HOST}:{record['port']}"
-            logger.info("[ACCESS] Container HEALTHY -> REUSING, redirect to %s", url)
-            return {"action": "reused", "url": url}
+            # Check if dimensions match
+            rec_width = record.get("width", containers.WIDTH)
+            rec_height = record.get("height", containers.HEIGHT)
+
+            if rec_width == use_width and rec_height == use_height:
+                state.touch_client(client_id)
+                url = f"https://{VNC_HOST}:{record['port']}"
+                logger.info("[ACCESS] Container HEALTHY + DIMENSIONS MATCH -> REUSING, redirect to %s", url)
+                return {"action": "reused", "url": url}
+            else:
+                logger.info("[ACCESS] DIMENSIONS CHANGED (was %sx%s, now %sx%s) -> recreating CPF=%s",
+                            rec_width, rec_height, use_width, use_height, client_id)
+                containers.remove_container(record["container_id"])
+                state.remove_by_client(client_id)
         else:
             logger.warning("[ACCESS] Container DEAD -> cleaning up CPF=%s container=%s",
                            client_id, record["container_id"][:12])
@@ -134,24 +158,27 @@ def get_or_create_access(client_id: str) -> dict:
     else:
         logger.info("[ACCESS] No existing record for CPF=%s", client_id)
 
-    # 2. Try to claim a pool container (instant!)
-    pool_rec = state.claim_pool_container(client_id)
-    if pool_rec:
-        if containers.is_container_healthy(pool_rec["container_id"]):
-            url = f"https://{VNC_HOST}:{pool_rec['port']}"
-            logger.info("[ACCESS] POOL -> assigned container=%s port=%d to CPF=%s (instant!)",
-                         pool_rec["container_id"][:12], pool_rec["port"], client_id)
+    # 2. Try to claim a pool container (only when using default dimensions)
+    if not custom_dimensions:
+        pool_rec = state.claim_pool_container(client_id, width=use_width, height=use_height)
+        if pool_rec:
+            if containers.is_container_healthy(pool_rec["container_id"]):
+                url = f"https://{VNC_HOST}:{pool_rec['port']}"
+                logger.info("[ACCESS] POOL -> assigned container=%s port=%d to CPF=%s (instant!)",
+                             pool_rec["container_id"][:12], pool_rec["port"], client_id)
 
-            # Replenish pool in background
-            warm_pool.replenish_pool()
+                # Replenish pool in background
+                warm_pool.replenish_pool()
 
-            return {"action": "pool", "url": url}
-        else:
-            logger.warning("[ACCESS] Pool container DEAD, cleaning up and continuing...")
-            containers.remove_container(pool_rec["container_id"])
-            state.remove_by_client(client_id)
+                return {"action": "pool", "url": url}
+            else:
+                logger.warning("[ACCESS] Pool container DEAD, cleaning up and continuing...")
+                containers.remove_container(pool_rec["container_id"])
+                state.remove_by_client(client_id)
+    else:
+        logger.info("[ACCESS] Custom dimensions provided, skipping pool containers")
 
-    logger.info("[ACCESS] No pool containers available, creating new one...")
+    logger.info("[ACCESS] Creating new container...")
 
     # 3. Allocate a free port
     used = state.used_ports()
@@ -166,20 +193,23 @@ def get_or_create_access(client_id: str) -> dict:
         logger.error("[ACCESS] No available ports and no containers to recycle for CPF=%s", client_id)
         raise ValueError("No available ports. All VNC slots are in use.")
 
-    # 4. Create container
-    logger.info("[ACCESS] Creating new container for CPF=%s on port %d...", client_id, port)
+    # 4. Create container with resolved dimensions
+    logger.info("[ACCESS] Creating new container for CPF=%s on port %d (width=%s height=%s)...",
+                client_id, port, use_width, use_height)
     try:
-        info = containers.create_container(client_id, port)
+        info = containers.create_container(client_id, port, width=use_width, height=use_height)
     except Exception as e:
         logger.exception("[ACCESS] FAILED to create container for CPF=%s: %s", client_id, e)
         raise RuntimeError(f"Failed to create container: {e}") from e
 
-    # 5. Persist
+    # 5. Persist (with dimensions)
     state.add_record(
         client_id=client_id,
         container_id=info["container_id"],
         container_name=info["container_name"],
         port=info["port"],
+        width=use_width,
+        height=use_height,
     )
 
     url = f"https://{VNC_HOST}:{port}"

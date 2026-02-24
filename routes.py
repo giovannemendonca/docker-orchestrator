@@ -18,8 +18,23 @@ def access():
         logger.warning("[ACCESS] Request with missing 'id' parameter")
         return jsonify({"error": "Missing required parameter: id"}), 400
 
+    # Optional custom dimensions — both must be provided, otherwise use ENV defaults
+    raw_width = request.args.get("width", "").strip()
+    raw_height = request.args.get("height", "").strip()
+
+    if raw_width and raw_height:
+        width = raw_width
+        height = raw_height
+        logger.info("[ACCESS] Custom dimensions: width=%s height=%s", width, height)
+    else:
+        width = None
+        height = None
+        if raw_width or raw_height:
+            logger.warning("[ACCESS] Only one dimension provided (width=%s height=%s), using ENV defaults",
+                           raw_width or "missing", raw_height or "missing")
+
     try:
-        result = services.get_or_create_access(client_id)
+        result = services.get_or_create_access(client_id, width=width, height=height)
     except ValueError as e:
         return jsonify({
             "error": str(e),

@@ -55,13 +55,16 @@ def find_by_client(client_id: str) -> dict | None:
     return None
 
 
-def add_record(client_id: str, container_id: str, container_name: str, port: int) -> dict:
+def add_record(client_id: str, container_id: str, container_name: str, port: int,
+               width: str = "", height: str = "") -> dict:
     now = datetime.now().isoformat()
     record = {
         "client_id": client_id,
         "container_id": container_id,
         "container_name": container_name,
         "port": port,
+        "width": width,
+        "height": height,
         "created_at": now,
         "last_accessed_at": now,
     }
@@ -124,11 +127,11 @@ def find_unassigned() -> list[dict]:
     return pool
 
 
-def claim_pool_container(client_id: str) -> dict | None:
+def claim_pool_container(client_id: str, width: str = "", height: str = "") -> dict | None:
     """Claim a pool container for a specific client.
 
     Finds the first __pool__ record, changes its client_id to the given CPF,
-    updates last_accessed_at, and returns the updated record.
+    updates last_accessed_at and dimensions, and returns the updated record.
     Returns None if no pool container is available.
     """
     now = datetime.now().isoformat()
@@ -151,6 +154,8 @@ def claim_pool_container(client_id: str) -> dict | None:
 
         pool_rec["client_id"] = client_id
         pool_rec["last_accessed_at"] = now
+        pool_rec["width"] = width
+        pool_rec["height"] = height
         _write_state(records)
 
     logger.info("[STATE] CLAIM pool: container=%s port=%d -> CPF=%s",
