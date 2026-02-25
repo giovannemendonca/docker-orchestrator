@@ -66,7 +66,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("ORCHESTRATOR_PORT", 8080))
     logger.info("========== ORCHESTRATOR RUNNING on port %d ==========", port)
 
-    context = ("fullchain.crt", "server.key")
+    context = ("/opt/docker-orchestrator/fullchain.crt", "/opt/docker-orchestrator/server.key")
 
     app.run(
            host="0.0.0.0",
